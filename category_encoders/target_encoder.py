@@ -2,6 +2,7 @@
 import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator
+from sklearn.model_selection import KFold, StratifiedKFold
 from category_encoders.ordinal import OrdinalEncoder
 import category_encoders.utils as util
 
@@ -39,7 +40,11 @@ class TargetEncoder(BaseEstimator, util.TransformerWithTargetMixin):
     smoothing: float
         smoothing effect to balance categorical average vs prior. Higher value means stronger regularization.
         The value must be strictly bigger than 0.
-
+    nfolds: int
+        multi-fold target encoding. Like cross validation, each fold will use the target encoding of remaining folds.
+        This is proven effective to deal with over-fitting.
+    stratified: bool
+        use stratified multi-fold or not.
     Example
     -------
     >>> from category_encoders import *
@@ -80,7 +85,7 @@ class TargetEncoder(BaseEstimator, util.TransformerWithTargetMixin):
     """
 
     def __init__(self, verbose=0, cols=None, drop_invariant=False, return_df=True, handle_missing='value',
-                     handle_unknown='value', min_samples_leaf=1, smoothing=1.0):
+                     handle_unknown='value', min_samples_leaf=1, smoothing=1.0, nfolds=1, stratified=False, random_state=None):
         self.return_df = return_df
         self.drop_invariant = drop_invariant
         self.drop_cols = []
@@ -91,10 +96,19 @@ class TargetEncoder(BaseEstimator, util.TransformerWithTargetMixin):
         self.smoothing = float(smoothing)  # Make smoothing a float so that python 2 does not treat as integer division
         self._dim = None
         self.mapping = None
+        self._kfold_helper = None
         self.handle_unknown = handle_unknown
         self.handle_missing = handle_missing
         self._mean = None
         self.feature_names = None
+        self.nfolds = nfolds
+        self.stratified = stratified
+        self.random_state = random_state
+        if self.nfolds > 1:
+            self.kfold = KFold(n_splits=self.nfolds, shuffle=True, random_state=self.random_state) \
+                if not self.stratified else StratifiedKFold(n_splits=self.nfolds, shuffle=True, random_state=self.random_state)
+        else:
+            self.kfold = None
 
     def fit(self, X, y, **kwargs):
         """Fit encoder according to X and y.
@@ -141,14 +155,14 @@ class TargetEncoder(BaseEstimator, util.TransformerWithTargetMixin):
         )
         self.ordinal_encoder = self.ordinal_encoder.fit(X)
         X_ordinal = self.ordinal_encoder.transform(X)
-        self.mapping = self.fit_target_encoding(X_ordinal, y)
-        
-        X_temp = self.transform(X, override_return_df=True)
+        self.mapping, self._kfold_helper = self.fit_target_encoding(X_ordinal, y)
+        X_temp = self.transform(X, y, override_return_df=True)
         self.feature_names = list(X_temp.columns)
 
         if self.drop_invariant:
             self.drop_cols = []
-            X_temp = self.transform(X)
+            # fixme: why here call again?
+            # X_temp = self.transform(X, y)
             generated_cols = util.get_generated_cols(X, X_temp, self.cols)
             self.drop_cols = [x for x in generated_cols if X_temp[x].var() <= 10e-5]
             try:
@@ -160,34 +174,36 @@ class TargetEncoder(BaseEstimator, util.TransformerWithTargetMixin):
 
         return self
 
+    def _smoothing(self, mean, count, prior):
+        smoove = 1 / (1 + np.exp(-(count - self.min_samples_leaf) / self.smoothing))
+        smoothing = prior * (1 - smoove) + mean * smoove
+        # count could be zero in multi-fold mode, fill it to mean
+        smoothing[count <= 1] = prior
+        return smoothing
+
     def fit_target_encoding(self, X, y):
         mapping = {}
-
+        kfold_helper = {}
+        self._mean = y.mean()
         for switch in self.ordinal_encoder.category_mapping:
             col = switch.get('col')
             values = switch.get('mapping')
-
-            prior = self._mean = y.mean()
-
-            stats = y.groupby(X[col]).agg(['count', 'mean'])
-
-            smoove = 1 / (1 + np.exp(-(stats['count'] - self.min_samples_leaf) / self.smoothing))
-            smoothing = prior * (1 - smoove) + stats['mean'] * smoove
-            smoothing[stats['count'] == 1] = prior
+            stats = y.groupby(X[col]).agg(['count', 'sum'])
+            stats['sum'] = stats['sum'].astype('float')
+            smoothing = self._smoothing(stats['sum'] / stats['count'], stats['count'], self._mean)
 
             if self.handle_unknown == 'return_nan':
                 smoothing.loc[-1] = np.nan
             elif self.handle_unknown == 'value':
-                smoothing.loc[-1] = prior
+                smoothing.loc[-1] = self._mean
 
             if self.handle_missing == 'return_nan':
                 smoothing.loc[values.loc[np.nan]] = np.nan
             elif self.handle_missing == 'value':
-                smoothing.loc[-2] = prior
-
+                smoothing.loc[-2] = self._mean
             mapping[col] = smoothing
-
-        return mapping
+            kfold_helper[col] = {'nan_idx': values.loc[np.nan], 'stats': stats}
+        return mapping, kfold_helper
 
     def transform(self, X, y=None, override_return_df=False):
         """Perform the transformation to new categorical data.
@@ -233,8 +249,7 @@ class TargetEncoder(BaseEstimator, util.TransformerWithTargetMixin):
         if self.handle_unknown == 'error':
             if X[self.cols].isin([-1]).any().any():
                 raise ValueError('Unexpected categories found in dataframe')
-
-        X = self.target_encode(X)
+        X = self.target_encode(X, y)
 
         if self.drop_invariant:
             for col in self.drop_cols:
@@ -245,12 +260,40 @@ class TargetEncoder(BaseEstimator, util.TransformerWithTargetMixin):
         else:
             return X.values
 
-    def target_encode(self, X_in):
+    def target_encode(self, X_in, y=None):
         X = X_in.copy(deep=True)
-
-        for col in self.cols:
-            X[col] = X[col].map(self.mapping[col])
-
+        if y is None or self.kfold is None:
+            for col in self.cols:
+                X[col] = X[col].map(self.mapping[col])
+        else:
+            for _, infold_index in self.kfold.split(X_in, y):
+                X_ = X.iloc[infold_index]
+                y_ = y[infold_index]
+                for col in self.cols:
+                    nan_idx = self._kfold_helper[col]['nan_idx']
+                    stats = self._kfold_helper[col]['stats']
+                    infold_stats = y_.groupby(X_[col]).agg(['count', 'sum'])
+                    # meet categories which didn't show up in fit
+                    infold_stats = infold_stats[infold_stats.index != -1]
+                    infold_stats['sum'] = infold_stats['sum'].astype('float')
+                    outfold_stats = stats.copy(deep=True)
+                    known_ids = infold_stats.index.astype('int64')
+                    # remove the ids that are not in current fold
+                    outfold_stats = outfold_stats.loc[known_ids]
+                    # get stats of other folds
+                    outfold_stats['count'] -= infold_stats['count']
+                    outfold_stats['sum'] -= infold_stats['sum']
+                    smoothing = self._smoothing(outfold_stats['sum'] / outfold_stats['count'], outfold_stats['count'], self._mean)
+                    # smoothing.fillna(self._mean)
+                    if self.handle_unknown == 'return_nan':
+                        smoothing.loc[-1] = np.nan
+                    elif self.handle_unknown == 'value':
+                        smoothing.loc[-1] = self._mean
+                    if self.handle_missing == 'return_nan':
+                        smoothing.loc[nan_idx] = np.nan
+                    elif self.handle_missing == 'value':
+                        smoothing.loc[-2] = self._mean
+                    X.loc[infold_index, col] = X.loc[infold_index, col].map(smoothing)
         return X
 
     def get_feature_names(self):
